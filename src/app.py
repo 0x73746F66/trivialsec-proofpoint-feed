@@ -60,6 +60,6 @@ def handler(event, context):
         should_report=internals.APP_ENV == "Prod",
         skip_collecting_http_body=True
     )
-    def main_wrapper(records: list[dict]):
-        main(records)
-    main_wrapper(event["Records"])
+    def main_wrapper():
+        main()
+    main_wrapper()
