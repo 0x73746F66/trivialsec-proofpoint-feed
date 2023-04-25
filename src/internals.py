@@ -7,8 +7,9 @@ import hmac
 import hashlib
 import threading
 import json
-from pathlib import Path
 import errno
+from pathlib import Path
+from uuid import UUID
 from os import path, getenv
 from socket import error as SocketError
 from typing import Union
@@ -18,6 +19,8 @@ from urllib.parse import urlparse
 from ipaddress import (
     IPv4Address,
     IPv6Address,
+    IPv4Network,
+    IPv6Network,
 )
 
 import boto3
@@ -32,18 +35,20 @@ from pydantic import (
 )
 
 
+PROOFPOINT_NAMESPACE = UUID('ccd0de11-376a-4bdb-a0de-fa2e5b6b5a69')
 DEFAULT_LOG_LEVEL = logging.WARNING
 LOG_LEVEL = getenv("LOG_LEVEL", 'WARNING')
 CACHE_DIR = getenv("CACHE_DIR", "/tmp")
 BUILD_ENV = getenv("BUILD_ENV", "development")
 JITTER_SECONDS = int(getenv("JITTER_SECONDS", default="30"))
 APP_ENV = getenv("APP_ENV", "Dev")
-APP_NAME = getenv("APP_NAME", "trivialscan-monitor-queue")
+APP_NAME = getenv("APP_NAME", "feed-processor-proofpoint")
 DASHBOARD_URL = "https://www.trivialsec.com"
 logger = logging.getLogger(__name__)
 if getenv("AWS_EXECUTION_ENV") is not None:
     boto3.set_stream_logger('boto3', getattr(logging, LOG_LEVEL, DEFAULT_LOG_LEVEL))
 logger.setLevel(getattr(logging, LOG_LEVEL, DEFAULT_LOG_LEVEL))
+logging.getLogger('urllib3').setLevel(logging.ERROR)
 
 
 def parse_authorization_header(authorization_header: str) -> dict[str, str]:
@@ -90,20 +95,22 @@ class HMAC:
     @property
     def scheme(self) -> Union[str, None]:
         return (
-            None
-            if not hasattr(self, "parsed_header")
-            else self.parsed_header.get("scheme")
+            self.parsed_header.get("scheme")
+            if hasattr(self, "parsed_header")
+            else None
         )
 
     @property
     def id(self) -> Union[str, None]:
-        return (
-            None if not hasattr(self, "parsed_header") else self.parsed_header.get("id")
-        )
+        return self.parsed_header.get("id") if hasattr(self, "parsed_header") else None
 
     @property
     def ts(self) -> Union[int, None]:
-        return None if not hasattr(self, "parsed_header") else int(self.parsed_header.get("ts"))  # type: ignore
+        return (
+            int(self.parsed_header.get("ts"))
+            if hasattr(self, "parsed_header")
+            else None
+        )
 
     @property
     def mac(self) -> Union[str, None]:
@@ -241,6 +248,9 @@ class JSONEncoder(json.JSONEncoder):
                 AnyHttpUrl,
                 IPv4Address,
                 IPv6Address,
+                IPv4Network,
+                IPv6Network,
+                UUID,
                 EmailStr,
             ),
         ):
@@ -267,18 +277,17 @@ def post_beacon(url: HttpUrl, body: dict, headers: dict = None):
     threading.Thread(target=_request_task, args=(url, body, headers)).start()
 
 
-
-@retry((SocketError), tries=3, delay=1.5, backoff=1)
-def download_file(remote_file: str, temp_dir: str = CACHE_DIR) -> Path:
+@retry((SocketError), tries=5, delay=1.5, backoff=1)
+def download_file(remote_file: str, temp_dir: str = CACHE_DIR) -> Path | None:
     session = requests.Session()
     remote_file = remote_file.replace(":80/", "/").replace(":443/", "/")
-    logger.info(f"[bold]Downloading[/bold] {remote_file}")
-    resp = session.get(
+    logger.info(f"[bold]Checking freshness[/bold] {remote_file}")
+    resp = session.head(
         remote_file,
         verify=remote_file.startswith('https'),
         allow_redirects=True,
-        timeout=30,
-        headers={'User-Agent': "trivialsec.com"}
+        timeout=5,
+        headers={'User-Agent': "Trivial Security"}
     )
     if not str(resp.status_code).startswith('2'):
         if resp.status_code == 403:
@@ -320,6 +329,13 @@ def download_file(remote_file: str, temp_dir: str = CACHE_DIR) -> Path:
             logger.info(f"[bold]Cached[/bold] {temp_path}")
             return Path(temp_path)
 
+    logger.info(f"[bold]Downloading[/bold] {remote_file}")
+    resp = session.get(
+        remote_file,
+        verify=remote_file.startswith('https'),
+        allow_redirects=True,
+        headers={'User-Agent': "Trivial Security"}
+    )
     handle = Path(temp_path)
     handle.write_text(resp.text, encoding='utf8')
     if etag:
